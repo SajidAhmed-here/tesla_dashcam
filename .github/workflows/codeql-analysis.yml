@@ -1,71 +1,101 @@
-# For most projects, this workflow file will not need changing; you simply need
-# to commit it to your repository.
-#
-# You may wish to alter this file to override the set of languages analyzed,
-# or to provide custom queries or build logic.
-#
-# ******** NOTE ********
-# We have attempted to detect the languages in your repository. Please check
-# the `language` matrix defined below to confirm you have the correct set of
-# supported CodeQL languages.
-#
-name: "CodeQL"
+name: CI
 
 on:
   push:
-    branches: [ dev, Master ]
   pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [ dev ]
-  schedule:
-    - cron: '28 17 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: UTC
 
 jobs:
-  analyze:
-    name: Analyze
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-
+  test:
+    name: Python 3.13 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'python' ]
-        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python' ]
-        # Learn more:
-        # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-    # Initializes the CodeQL tools for scanning.
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v1
-      with:
-        languages: ${{ matrix.language }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-        # queries: ./path/to/local/query, your-org/your-repo/queries@main
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # Match the minimum version in setup.py and README.md.
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements_dev.txt
+            requirements_windows.txt
+            setup.py
 
-    # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
-    # If this step fails, then you should remove it and run the build manually (see below)
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v1
+      - name: Install Linux runtime tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg fonts-freefont-ttf libnotify-bin
 
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 https://git.io/JvXDl
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build -r requirements.txt -r requirements_dev.txt
 
-    # ✏️ If the Autobuild fails above, remove it and uncomment the following three lines
-    #    and modify them (or add more) to build your code if your project
-    #    uses a compiled language
+      - name: Install Windows notification dependencies
+        if: runner.os == 'Windows'
+        run: python -m pip install -r requirements_windows.txt
 
-    #- run: |
-    #   make bootstrap
-    #   make release
+      - name: Build source distribution and wheel
+        run: python -m build
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v1
+      - name: Install the built package and check dependencies
+        run: |
+          python -m pip install dist/*.whl
+          python -m pip check
+
+      - name: Run the complete test suite
+        run: python -m pytest tests -v
+
+      - name: Check installed CLI entry points
+        # Run outside the checkout so imports must come from the installed wheel.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m tesla_dashcam --version
+          python -m tesla_dashcam --help
+          tesla_dashcam --version
+          tesla_dashcam --help
+
+      - name: Check FFmpeg encoding and application metadata parsing
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}
+        run: |
+          ffmpeg -version
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i color=c=black:s=128x96:r=24 -t 1 \
+            -c:v libx264 -pix_fmt yuv420p ci-smoke.mp4
+          python - <<'PY'
+          from tesla_dashcam.tesla_dashcam import get_metadata
+
+          metadata = get_metadata("ffmpeg", ["ci-smoke.mp4"])
+          assert len(metadata) == 1, metadata
+          assert metadata[0].duration > 0, metadata[0].duration
+          assert (metadata[0].width, metadata[0].height) == (128, 96)
+          PY
